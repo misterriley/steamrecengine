@@ -16,6 +16,14 @@ class GamesCache:
         self.latent_data = None
         self.calc_fields()
 
+    def get_game_name(self, game_id):
+        result = self.game_data.loc[self.game_data['game_id'] == game_id, 'name']
+
+        # If you expect only one value, you can use `.iloc[0]` to get the first match
+        value = result.iloc[0]
+
+        return value
+
     def calc_fields(self):
         """Calculate fields using TF-IDF and SVD."""
         last_col_before_data = self.game_data.columns.get_loc("IsAGame")
@@ -37,6 +45,7 @@ class GamesCache:
         total_tags = np.maximum(np.sum(mat, axis=1, keepdims=True), 1)
         TF = mat / total_tags
         DF = np.sum(mat > 0, axis=0)
+        DF = np.maximum(DF, 1)
         num_documents = mat.shape[0]
         IDF = np.log(num_documents / DF)
         tfidf = TF * IDF

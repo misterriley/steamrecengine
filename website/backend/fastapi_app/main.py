@@ -1,21 +1,39 @@
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
-from databases import Database
-from sqlalchemy import Column, Integer, String, Table, MetaData, Float, create_engine, inspect
-import uvicorn
-from typing import List
+import asyncio
+import logging
 import math
-import time
-import pandas as pd
-import asyncpg
+from typing import List
 
+import asyncpg
+import pandas as pd
+import uvicorn
+from databases import Database
+from fastapi import FastAPI, HTTPException, Query
+from sqlalchemy import Column, Integer, String, Table, MetaData, Float
+from fastapi.middleware.cors import CORSMiddleware
+
+from constantsCache import ConstantsCache
 from gamesCache import GamesCache
+from predictionEngine import PredictionEngine
+
+# FastAPI instance
+app = FastAPI()
+
+origins = [
+    "http://localhost:8080",  # or whatever port your frontend runs on
+    "http://127.0.0.1:8080"
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Database configuration
 DATABASE_URL = "postgresql://bleem:bleem112358@localhost:5432/game_data"
 database = Database(DATABASE_URL)
-
-# FastAPI instance
-app = FastAPI()
 
 # Database metadata and table definitions
 metadata = MetaData()
@@ -51,8 +69,7 @@ computation_states = Table(
     metadata,
     Column("computation_id", Integer, primary_key=True),
     Column("user_id", Integer, nullable=False),
-    Column("status", String(255), nullable=False),
-    Column("message", String(255), nullable=True),
+    Column("computation_state", Integer, nullable=False),
 )
 
 computation_results = Table(
@@ -66,16 +83,21 @@ computation_results = Table(
 )
 
 # Caching games data
-games_cache = None
+games_cache: GamesCache = None
+constants_cache: ConstantsCache = None
 
 
 # Startup and shutdown hooks
 @app.on_event("startup")
 async def startup():
     await database.connect()
+
+    global constants_cache
+    all_constants = await get_constants()
+    constants_cache = ConstantsCache(all_constants)
+
     global games_cache
-    all_games = await load_all_games()
-    games_cache = GamesCache(all_games)
+    games_cache = await load_games_cache()
 
 
 @app.on_event("shutdown")
@@ -84,11 +106,13 @@ async def shutdown():
 
 
 # Helper functions
-async def load_all_games(chunk_size: int = 50000):
+async def load_games_cache(chunk_size: int = 50000, max_rows=None):
     """Fetch games data in chunks using asyncpg."""
     conn = await asyncpg.connect(DATABASE_URL)
     offset = 0
     all_data = []
+    if max_rows is not None:
+        chunk_size = min(chunk_size, max_rows)
 
     while True:
         query = f"SELECT * FROM games ORDER BY game_id LIMIT {chunk_size} OFFSET {offset}"
@@ -99,10 +123,16 @@ async def load_all_games(chunk_size: int = 50000):
 
         # Convert rows to dictionaries and append
         all_data.extend([dict(row) for row in rows])
+
+        # Stop if we've reached the maximum rows for testing
+        if max_rows is not None and len(all_data) >= max_rows:
+            all_data = all_data[:max_rows]  # Truncate to the exact number
+            break
+
         offset += chunk_size
 
     await conn.close()
-    return pd.DataFrame(all_data)
+    return GamesCache(pd.DataFrame(all_data))
 
 
 # Routes
@@ -119,26 +149,41 @@ async def get_all_users():
 
 @app.get("/user_preferences/{user_id}")
 async def get_user_preferences(user_id: int):
-    rows = await database.fetch_all(user_preferences.select().where(user_preferences.c.user_id == user_id))
+    rows = await database.fetch_all(
+        user_preferences.select()
+        .where(user_preferences.c.user_id == user_id)
+        .order_by(user_preferences.c.game_id)
+    )
     if not rows:
         raise HTTPException(status_code=404, detail=f"No preferences found for user_id {user_id}")
     sanitized_rows = [
         {**row, "rating": None if row["rating"] is None or math.isnan(row["rating"]) else row["rating"]}
         for row in rows
     ]
-    return sanitized_rows
+
+    ret = []
+    for row in sanitized_rows:
+        if row["rating"] is not None or row["status"] == constants_cache.STATUS_MORE or row["status"] == constants_cache.STATUS_LESS or row["status"] == constants_cache.STATUS_IGNORE:
+            game_id = row["game_id"]
+            row["name"] = games_cache.get_game_name(game_id)
+            ret.append(row)
+
+    return ret
 
 
 @app.get("/get_game_names_by_ids/")
 async def get_game_names_by_ids(game_ids: List[int] = Query(...)):
     if game_ids != sorted(game_ids):
         raise HTTPException(status_code=400, detail="The list of game_ids must be sorted")
-    rows = await database.fetch_all(games.select().where(games.c.game_id.in_(game_ids)))
-    found_game_ids = {row["game_id"] for row in rows}
-    missing_game_ids = [game_id for game_id in game_ids if game_id not in found_game_ids]
-    if missing_game_ids:
+    t = games_cache.game_data
+    filtered_games = t.loc[t['game_id'].isin(game_ids), :]
+
+    # Check if any game_ids are missing
+    if len(filtered_games) != len(game_ids):
+        found_game_ids = set(filtered_games['game_id'])  # Extract found game_ids
+        missing_game_ids = set(game_ids) - found_game_ids  # Find missing game_ids
         raise HTTPException(status_code=404, detail=f"The following game_ids are not found: {missing_game_ids}")
-    return {"game_names": [row["name"] for row in rows]}
+    return {"game_names": filtered_games['name'].tolist()}
 
 
 @app.post("/add_preference/")
@@ -187,31 +232,45 @@ async def get_constants():
     rows = await database.fetch_all(constants.select())
     if not rows:
         raise HTTPException(status_code=404, detail="No constants found")
-    return rows
+    c = [{"name": row["name"], "value": row["value"]} for row in rows]
+    for d in c:
+        if d["value"] == round(d["value"]):
+            d["value"] = int(d["value"])
+    return c
 
 
-@app.post("/run_prediction_computation/")
-async def run_prediction_computation(user_id: int, background_tasks: BackgroundTasks):
-    query = computation_states.insert().values(user_id=user_id, status="started", message="Computation has started")
+@app.get("/run_prediction_computation/{user_id}")
+async def run_prediction_computation(user_id: int):
+    user_prefs = await get_user_preferences(user_id)
+    query = computation_states.insert().values(user_id=user_id, computation_state=constants_cache.COMP_STATUS_STARTED)
     computation_id = await database.execute(query)
-    background_tasks.add_task(perform_computation, computation_id, user_id)
+    asyncio.create_task(gather_predictions(computation_id, user_id, user_prefs))
     return {"computation_id": computation_id}
 
 
-async def perform_computation(computation_id: int, user_id: int):
+async def gather_predictions(computation_id: int, user_id: int, user_prefs):
     try:
-        await database.execute(
-            computation_states.update().where(computation_states.c.computation_id == computation_id).values(
-                status="in progress", message=f"Computation for user {user_id} is running"))
-        time.sleep(5)
-        await database.execute(
-            computation_states.update().where(computation_states.c.computation_id == computation_id).values(
-                status="completed", message=f"Computation for user {user_id} completed successfully"))
-    except Exception as e:
-        await database.execute(
-            computation_states.update().where(computation_states.c.computation_id == computation_id).values(
-                status="failed", message=f"Computation for user {user_id} failed: {str(e)}"))
+        await update_comp_status(computation_id, constants_cache.COMP_STATUS_FINDING_BEST_REGRESSIONS)
+        regr_best_rd = PredictionEngine.tune_regression(games_cache, constants_cache, user_prefs)
 
+        await update_comp_status(computation_id, constants_cache.COMP_STATUS_FINDING_BEST_CLASSIFIER)
+        lgst_best_rd = PredictionEngine.tune_classifier(games_cache, constants_cache, user_prefs)
+
+        await update_comp_status(computation_id, constants_cache.COMP_STATUS_SORTING_PREDICTIONS)
+        predictions = PredictionEngine.get_predictions(regr_best_rd, lgst_best_rd, games_cache, constants_cache, None)
+
+        await update_comp_status(computation_id, constants_cache.COMP_STATUS_FINISHED)
+        return predictions
+    except Exception as e:
+        print(e)
+        await update_comp_status(computation_id, constants_cache.COMP_STATUS_ERROR)
+        return None
+
+
+async def update_comp_status(computation_id, comp_status):
+    await database.execute(
+        computation_states.update().where(computation_states.c.computation_id == computation_id).values(
+            computation_state=comp_status))
 
 @app.get("/retrieve_computation_results/")
 async def retrieve_computation_results(computation_id: int):
